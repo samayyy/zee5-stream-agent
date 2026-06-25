@@ -1,0 +1,8 @@
+{
+  "identity_type": "AGENT_IDENTITY",
+  "agent_gateway_config": {
+    "agent_to_anywhere_config": {
+      "agent_gateway": "projects/gm-test-337806/locations/asia-southeast1/agentGateways/agentgw-publicmcp"
+    }
+  }
+}
