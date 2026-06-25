@@ -1,7 +1,9 @@
 # Installed by `adk deploy agent_engine` on top of the base google-adk.
-# The [mcp] extra pulls the `mcp` SDK that ADK's McpToolset needs — without it,
-# `from google.adk.tools.mcp_tool import McpToolset` raises ImportError in the container.
-google-adk[mcp]==2.2.0
+# [mcp] -> the `mcp` SDK ADK's McpToolset needs.
+# [a2a] -> the `a2a` SDK the Agent Engine API server imports at startup
+#          (a2a.server.tasks.InMemoryTaskStore); WITHOUT it the container crashes
+#          on boot with "ModuleNotFoundError: No module named 'a2a'".
+google-adk[a2a,mcp]==2.2.0
 # >=1.148.0 is the first release whose AgentEngineConfig accepts agent_gateway_config
 # (validated client-side at deploy; an older SDK rejects the key).
 google-cloud-aiplatform[agent_engines]>=1.148.1
