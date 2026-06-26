@@ -1,68 +1,79 @@
-# Fixing CERTIFICATE_VERIFY_FAILED on a gateway-bound agent
+# CERTIFICATE_VERIFY_FAILED on a gateway-bound agent — diagnose before you touch certs
 
-## What's wrong
-Agent Gateway egress runs on a **Secure Web Proxy that does TLS interception** — it
-re-signs every outbound TLS connection with a **private CA** the Agent Runtime
-image doesn't trust. So the agent fails on *every* egress hop (gRPC
-`cloudresourcemanager` at startup, aiohttp `aiplatform`, the run.app MCPs) with
-`self-signed certificate in certificate chain`.
+> **Correction (June 26, 2026).** An earlier version of this file claimed the Agent
+> Gateway always does TLS interception and that you must install its private root CA.
+> **That was wrong.** The official codelab
+> (codelabs.developers.google.com/cloudnet-agent-gateway) and the official
+> [`terraform-google-agent-gateway`](https://github.com/GoogleCloudPlatform/terraform-google-agent-gateway)
+> module install **no** custom CA, set **none** of the SSL trust env vars, and the
+> `agentGateway` resource has **no TLS-inspection field at all** — yet their agent
+> egresses fine. A correctly-configured agent-to-anywhere gateway does **not** re-sign
+> your egress. **The CA install at the bottom of this file is NOT the normal fix.**
+> The normal fix is `DEPLOY.md` (Agent Registry + IAP authz + `iap.egressor`).
 
-It is **NOT** an authorization problem — it persists even with the gateway in
-**Audit only** (TLS re-signing happens at the handshake, before any IAP decision).
-More registry entries / `iap.egressor` grants will not fix it. The container must
-**trust the gateway's private root CA**.
+## What the self-signed error almost always is
+`self signed certificate in certificate chain` inside a gateway-bound container is
+the gateway's **pre-IAP deny artifact for an UNREGISTERED destination**. The gateway
+refuses to proxy any host that isn't in its **regional** Agent Registry, and on that
+refusal the egress hop fails TLS. It surfaces first at **startup on the gRPC
+`cloudresourcemanager` call** (`AdkApp.set_up` → `project_id`) because that is the
+first Google API the agent dials.
 
-## The fix (run in Cloud Shell on the gateway project)
+It **persists under Audit-only / DRY_RUN** *not* because it's a TLS problem, but
+because Audit-only relaxes only the **IAP** layer — the registry-layer block fires
+**before** IAP (which is also why there is no IAP audit-log row for it). "Survives
+Audit-only" therefore does **not** prove it's a cert problem.
+
+## Diagnose (run these first — they decide everything)
+```bash
+PROJECT_ID=gm-test-337806; REGION=asia-southeast1; GATEWAY_ID=agentgw-publicmcp
+
+# A) Is TLS inspection even configured?  EMPTY = no interception = do NOT install a CA.
+gcloud network-security tls-inspection-policies list --location="$REGION" --project="$PROJECT_ID"
+
+# B) Does the gateway point at the REGIONAL registry?  (/locations/global = everything denied)
+gcloud alpha network-services agent-gateways describe "$GATEWAY_ID" \
+  --location="$REGION" --project="$PROJECT_ID" \
+  --format="yaml(registries,googleManaged,protocols)"
+#    registries: MUST end in /locations/asia-southeast1   (NOT /locations/global)
+
+# C) Are the Google APIs the agent itself calls actually registered?
+gcloud alpha agent-registry services list --project="$PROJECT_ID" --location="$REGION" \
+  --format="value(name)" | grep -E "cloudresourcemanager|aiplatform" || echo "NOT REGISTERED"
+```
+
+## Fix (the real one — full runbook in DEPLOY.md)
+- **B shows `/locations/global`** → re-import the gateway pointing at the regional
+  registry (DEPLOY.md Step 1). This alone makes every regional registration visible.
+- **C prints `NOT REGISTERED`** → `./scripts/register_gateway_endpoints.sh $PROJECT_ID $REGION`
+  (registers ~15 Google APIs × 5 hostname permutations + the MCPs), then attach the IAP
+  authz policy (DRY_RUN, Step 3), grant `roles/iap.egressor` registry-wide (Step 5), test
+  under DRY_RUN reading the IAP audit log (Step 6), then flip to ENFORCE (Step 7).
+
+The agent dying at startup on `cloudresourcemanager` is the classic signature of **C**:
+that Google API was never registered (or the registry is global, **B**).
+
+## Only if A returns a TLS-inspection policy
+Then — and only then — the gateway's egress Secure Web Proxy really is re-signing with
+a private CA and the container must trust it. The scaffolding in this repo
+(`gateway_ca/deploy_with_gateway_ca.py` + `installation_scripts/install.sh`) handles
+that case: it installs the CA from the TLS-inspection policy's CA-Service pool into both
+trust stacks and points `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` /
+`GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` at a combined bundle. **This is in addition to
+registration (DEPLOY.md), never instead of it** — even with the CA trusted, an
+unregistered destination is still blocked before IAP.
 
 ```bash
-export PROJECT_ID="gm-test-337806"
-export REGION="asia-southeast1"
-export GATEWAY_ID="agentgw-publicmcp"
-cd zee5-stream-agent
-
-# 1) Get the gateway's private root CA. Try the gateway resource first:
-gcloud alpha network-services agent-gateways describe "$GATEWAY_ID" --location="$REGION" \
-  --format="value(agentGatewayCard.rootCertificates)" > gateway-root.crt
-head -1 gateway-root.crt   # must be: -----BEGIN CERTIFICATE-----
-
-# If that is empty, get it from the TLS-inspection policy's CA pool instead:
-#   POOL=$(gcloud network-security tls-inspection-policies list --location="$REGION" --format='value(caPool)' | head -1)
-#   gcloud privateca roots list --pool="${POOL##*/}" --location="$REGION" --format='value(name)'   # -> ROOT_CA
-#   gcloud privateca roots describe ROOT_CA --pool="${POOL##*/}" --location="$REGION" \
-#     --format="value(pemCaCertificates[0])" > gateway-root.crt
-
-# 2) Deploy bound to the gateway WITH the CA installed + trust env vars set:
-python3 -m venv .venv && source .venv/bin/activate
-pip install -q "google-adk[a2a,mcp]==2.2.0" "google-cloud-aiplatform[agent_engines]>=1.148.1"
-python gateway_ca/deploy_with_gateway_ca.py     # prints the new engine resource name
+# (conditional) fetch the CA from the TLS-inspection policy's CA pool:
+POOL=$(gcloud network-security tls-inspection-policies list --location="$REGION" --format='value(caPool)' | head -1)
+gcloud privateca roots list --pool="${POOL##*/}" --location="$REGION" --format='value(name)'   # -> ROOT_CA
+gcloud privateca roots describe ROOT_CA --pool="${POOL##*/}" --location="$REGION" \
+  --format="value(pemCaCertificates[0])" > gateway-root.crt
+python gateway_ca/deploy_with_gateway_ca.py
 ```
 
-`deploy_with_gateway_ca.py` ships `gateway_ca/install.sh` into the build (it runs
-as root: `update-ca-certificates` for OpenSSL/aiohttp/requests, and builds a
-combined PEM for gRPC), and sets the three trust env vars on the deployed agent:
-
-```
-SSL_CERT_FILE=/etc/ssl/certs/combined-ca.pem
-REQUESTS_CA_BUNDLE=/etc/ssl/certs/combined-ca.pem
-GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/combined-ca.pem   # gRPC C-core ignores the OS store; this is non-negotiable
-```
-
-## After deploy
-Grant the new engine's identity `iap.egressor` (registry-wide) + baseline roles
-(see DEPLOY.md Step 5) and smoke-test. With the CA trusted, the handshake
-succeeds and the IAP allow/deny layer takes over (which is what the registry +
-egressor were always for).
-
-## Caveats
-- **gRPC ordering:** `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` is read once at first
-  channel creation. Deploy-time env_vars (as here) is correct; don't try to set
-  it in code after `import vertexai`.
-- **aiohttp:** doesn't honor `SSL_CERT_FILE` automatically, but
-  `update-ca-certificates` into the OS store usually covers it. If the
-  `aiplatform` leg still throws after this, that call needs an explicit
-  `ssl.SSLContext` (ADK has no custom-CA knob yet — adk-python#2881).
-- **Escalation (if the handshake still fails after installing the named-pool
-  root):** ask Google Cloud, *"How do we obtain the root CA the Agent Gateway's
-  Secure Web Proxy presents on the container egress leg, to add to the Agent
-  Runtime trust store?"* — attach the failing `:authority` hostnames and the cert
-  chain the container received.
+### gRPC caveat (only relevant in the CA case)
+`GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` is read once at first channel creation and Python
+gRPC sometimes ignores it (grpc/grpc#27549). Merging the root into the compiled-in
+bundle (`SSL_CERT_FILE`) as `install.sh` does is the reliable path; aiohttp doesn't
+honor `SSL_CERT_FILE` (aiohttp#3180) but `update-ca-certificates` covers it.
