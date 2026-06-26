@@ -43,10 +43,13 @@ from stream_agent.agent import root_agent  # noqa: E402
 
 app = agent_engines.AdkApp(agent=root_agent)
 
+# UPDATE the existing engine in place when AGENT_ENGINE_ID is set (keeps the same
+# bond + iap.egressor grant, avoids the one-bonded-engine-per-project limit).
+# Otherwise CREATE a new bonded engine.
+AGENT_ENGINE_ID = os.environ.get("AGENT_ENGINE_ID", "").strip()
+
 COMBINED = "/etc/ssl/certs/combined-ca.pem"
-remote = client.agent_engines.create(
-    agent=app,
-    config={
+_config = {
         "display_name": "Stream Discovery Agent (gateway+CA)",
         "identity_type": "AGENT_IDENTITY",
         "agent_gateway_config": {
@@ -78,6 +81,13 @@ remote = client.agent_engines.create(
             "REQUESTS_CA_BUNDLE": COMBINED,
             "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH": COMBINED,
         },
-    },
-)
-print("Deployed:", remote.api_resource.name)
+}
+
+if AGENT_ENGINE_ID:
+    name = f"projects/{PROJECT_ID}/locations/{REGION}/reasoningEngines/{AGENT_ENGINE_ID}"
+    print("Updating in place:", name)
+    remote = client.agent_engines.update(name=name, agent=app, config=_config)
+else:
+    print("Creating a new bonded engine")
+    remote = client.agent_engines.create(agent=app, config=_config)
+print("Done:", remote.api_resource.name)
