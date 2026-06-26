@@ -36,7 +36,12 @@ os.environ.setdefault("STREAM_MODEL_LOCATION", "global")
 os.environ.setdefault("PUBLIC_MCP_URL", MCP1_URL)
 os.environ.setdefault("PRIVATE_MCP_URL", MCP2_URL)
 
-vertexai.init(project=PROJECT_ID, location=REGION)
+# build_options/extra_packages require a GCS staging bucket to upload the build context.
+STAGING_BUCKET = os.environ.get("STAGING_BUCKET", f"gs://{PROJECT_ID}-agent-engine-staging")
+if not STAGING_BUCKET.startswith("gs://"):
+    STAGING_BUCKET = "gs://" + STAGING_BUCKET
+
+vertexai.init(project=PROJECT_ID, location=REGION, staging_bucket=STAGING_BUCKET)
 client = vertexai.Client(project=PROJECT_ID, location=REGION, http_options=dict(api_version="v1beta1"))
 
 from stream_agent.agent import root_agent  # noqa: E402
@@ -51,6 +56,7 @@ AGENT_ENGINE_ID = os.environ.get("AGENT_ENGINE_ID", "").strip()
 COMBINED = "/etc/ssl/certs/combined-ca.pem"
 _config = {
         "display_name": "Stream Discovery Agent (gateway+CA)",
+        "staging_bucket": STAGING_BUCKET,
         "identity_type": "AGENT_IDENTITY",
         "agent_gateway_config": {
             "agent_to_anywhere_config": {
