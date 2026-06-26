@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 stream_agent/.env
 .DS_Store
+gateway-root.crt

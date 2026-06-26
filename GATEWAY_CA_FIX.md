@@ -22,14 +22,14 @@ cd zee5-stream-agent
 
 # 1) Get the gateway's private root CA. Try the gateway resource first:
 gcloud alpha network-services agent-gateways describe "$GATEWAY_ID" --location="$REGION" \
-  --format="value(agentGatewayCard.rootCertificates)" > gateway_ca/gateway-root.crt
-head -1 gateway_ca/gateway-root.crt   # must be: -----BEGIN CERTIFICATE-----
+  --format="value(agentGatewayCard.rootCertificates)" > gateway-root.crt
+head -1 gateway-root.crt   # must be: -----BEGIN CERTIFICATE-----
 
 # If that is empty, get it from the TLS-inspection policy's CA pool instead:
 #   POOL=$(gcloud network-security tls-inspection-policies list --location="$REGION" --format='value(caPool)' | head -1)
 #   gcloud privateca roots list --pool="${POOL##*/}" --location="$REGION" --format='value(name)'   # -> ROOT_CA
 #   gcloud privateca roots describe ROOT_CA --pool="${POOL##*/}" --location="$REGION" \
-#     --format="value(pemCaCertificates[0])" > gateway_ca/gateway-root.crt
+#     --format="value(pemCaCertificates[0])" > gateway-root.crt
 
 # 2) Deploy bound to the gateway WITH the CA installed + trust env vars set:
 python3 -m venv .venv && source .venv/bin/activate
