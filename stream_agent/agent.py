@@ -2,7 +2,7 @@
 
 A single LlmAgent that holds TWO McpToolset instances, both pointed at public
 Cloud Run FastMCP servers (Streamable HTTP):
-  - PUBLIC catalog MCP        (synthetic content catalog)
+  - PUBLIC catalog MCP          (synthetic content catalog)
   - PRIVATE personalization MCP (synthetic subscriber/account data)
 
 Both toolsets are constructed SYNCHRONOUSLY at import time so that `adk web`,
@@ -12,9 +12,10 @@ Egress governance: on Agent Engine this agent is bound to a Google Cloud Agent
 Gateway (agent-to-anywhere). The gateway transparently governs all outbound
 egress (the agent just dials the literal run.app MCP URLs); allowed destinations
 are controlled by the Agent Registry + IAM (roles/iap.egressor), not by code.
-The legacy PROXY_SERVER_URL / OIDC (PUBLIC_MCP_AUDIENCE) / static-token paths
-below stay for backward-compat and are INERT when those env vars are unset —
-which is the case for the gateway deployment (MCPs are public/unauthenticated).
+
+NOTE on the intermittent `RuntimeError: Event loop is closed`: that was NOT the
+McpToolset — it was a cached genai model client (see _GlobalGemini below).
+McpToolset is the standard, ADK-idiomatic transport and is used here.
 """
 import os
 
@@ -22,16 +23,17 @@ import httpx
 
 from google.adk.agents import LlmAgent
 from google.adk.tools.mcp_tool import McpToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool.mcp_session_manager import (
+    StreamableHTTPConnectionParams,
+    SseConnectionParams,
+)
 from google.adk.models.google_llm import Gemini
 from google.genai import types as genai_types
 from google.genai import Client as GenaiClient
 
 from .instructions import DISCOVERY_INSTRUCTION
 
-MODEL = os.environ.get("STREAM_MODEL", "gemini-2.5-flash")  # gemini-flash-latest 404s on Vertex us-central1
-# "global" routes the MODEL via the global Vertex endpoint (gemini-3.x flash-lite is global-only),
-# while GOOGLE_CLOUD_LOCATION (used by the Agent Engine session service) stays regional.
+MODEL = os.environ.get("STREAM_MODEL", "gemini-2.5-flash")
 MODEL_LOCATION = os.environ.get("STREAM_MODEL_LOCATION", "")
 SUBSCRIBER_ID = os.environ.get("STREAM_SUBSCRIBER_ID", "SUB-IN-100023")
 PLAN_TIER = os.environ.get("STREAM_PLAN_TIER", "Premium-HD")
@@ -105,8 +107,12 @@ def _public_httpx_factory(proxy_url: str, oidc_audience: str):
 
 
 # ---- PUBLIC catalog toolset (internet) -------------------------------------------------
-# Cloud: IAM-gated MCP reached with OIDC (PUBLIC_MCP_AUDIENCE set), optionally via the Agent
-# Engine proxy. Local dev: static bearer token (PUBLIC_MCP_TOKEN), no custom httpx client.
+# Transport selector. Default is streamable-HTTP (/mcp) — the known-good baseline. SSE
+# (MCP_TRANSPORT=sse, URLs -> /sse) regressed in this gateway-bound + single-instance Cloud
+# Run topology, so it is not the default.
+_MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "streamable").strip().lower()
+_ConnParams = SseConnectionParams if _MCP_TRANSPORT == "sse" else StreamableHTTPConnectionParams
+
 _public_params = dict(
     url=PUBLIC_MCP_URL,
     headers={} if PUBLIC_MCP_AUDIENCE else _bearer(PUBLIC_MCP_TOKEN),
@@ -117,38 +123,38 @@ if PROXY_SERVER_URL or PUBLIC_MCP_AUDIENCE:
     _public_params["httpx_client_factory"] = _public_httpx_factory(PROXY_SERVER_URL, PUBLIC_MCP_AUDIENCE)
 
 public_catalog = McpToolset(
-    connection_params=StreamableHTTPConnectionParams(**_public_params),
+    connection_params=_ConnParams(**_public_params),
     tool_filter=PUBLIC_TOOLS,
 )
 
-# ---- PRIVATE personalization toolset (VPN / PSC-I only) --------------------------------
+# ---- PRIVATE personalization toolset ---------------------------------------------------
 private_personalization = McpToolset(
-    connection_params=StreamableHTTPConnectionParams(
+    connection_params=_ConnParams(
         url=PRIVATE_MCP_URL, headers=_bearer(PRIVATE_MCP_TOKEN),
         timeout=20.0, sse_read_timeout=300.0,
     ),
     tool_filter=PRIVATE_TOOLS,
 )
 
+_TOOLS = [public_catalog, private_personalization]
+
 # gemini-3.x flash-lite is served ONLY on the GLOBAL Vertex endpoint. _GlobalGemini pins the
 # MODEL's genai client to location="global" (ADK's documented api_client override), independent of
-# GOOGLE_CLOUD_LOCATION — so the Agent Engine session service can stay regional (us-central1).
-_global_client: GenaiClient | None = None
-
-
-def _global_gemini_client() -> GenaiClient:
-    global _global_client
-    if _global_client is None:
-        _global_client = GenaiClient(
-            vertexai=True, project=os.environ.get("GOOGLE_CLOUD_PROJECT"), location="global"
-        )
-    return _global_client
-
-
+# GOOGLE_CLOUD_LOCATION — so the Agent Engine session service can stay regional.
+#
+# CRITICAL: use a plain @property, NOT @cached_property / a module-level cache. ADK's own
+# docstring warns: "Use @property instead of @cached_property if you hit asyncio lock
+# contention in multithreaded code." Agent Engine serves each invocation on a NEW thread +
+# NEW event loop (runners.py: asyncio.run(...) per call). A cached genai Client binds its
+# async httpx transport to the FIRST loop; on the next invocation's loop it throws
+# `RuntimeError: Event loop is closed`. Returning a FRESH client per access binds it to the
+# current loop — this is the actual fix for the intermittent loop errors (NOT the MCP layer).
 class _GlobalGemini(Gemini):
     @property
     def api_client(self) -> GenaiClient:  # type: ignore[override]
-        return _global_gemini_client()
+        return GenaiClient(
+            vertexai=True, project=os.environ.get("GOOGLE_CLOUD_PROJECT"), location="global"
+        )
 
 
 # Retry transient Vertex 429s (dynamic shared quota) with backoff rather than failing the turn.
@@ -163,5 +169,5 @@ root_agent = LlmAgent(
     name="stream_discovery_agent",
     description="Personalized Stream Discovery content-discovery concierge using public catalog + private subscriber data.",
     instruction=DISCOVERY_INSTRUCTION.format(subscriber_id=SUBSCRIBER_ID, plan_tier=PLAN_TIER),
-    tools=[public_catalog, private_personalization],
+    tools=_TOOLS,
 )

@@ -1,0 +1,15 @@
+# Agent Gateway (agent-to-anywhere / egress) import spec.
+# Render with envsubst (see PLAYBOOK.md) then:
+#   gcloud alpha network-services agent-gateways import "$GATEWAY_ID" \
+#     --location="$REGION" --project="$PROJECT_ID" --source=gateway.yaml
+#
+# registries MUST point at the REGIONAL Agent Registry (locations/$REGION).
+# Pointing it at locations/global makes the gateway consult an empty registry
+# and default-deny everything — the #1 silent misconfiguration.
+name: projects/${PROJECT_ID}/locations/${REGION}/agentGateways/${GATEWAY_ID}
+googleManaged:
+  governedAccessPath: AGENT_TO_ANYWHERE
+protocols:
+- MCP
+registries:
+- //agentregistry.googleapis.com/projects/${PROJECT_ID}/locations/${REGION}

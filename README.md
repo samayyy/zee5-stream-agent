@@ -1,5 +1,9 @@
 # zee5-stream-agent — Stream Discovery ADK agent (Agent Engine + Agent Gateway)
 
+> **Deploying from scratch?** Follow [`PLAYBOOK.md`](PLAYBOOK.md) — a step-by-step
+> Cloud Shell runbook that stands up the MCPs, the gateway, and this agent (with
+> IAP enforcement) in a fresh project. `deploy.py` is the env-driven deploy entrypoint.
+
 A Google ADK 2.x `LlmAgent` ("Stream Discovery Concierge") that personalizes
 content recommendations using **two public Cloud Run MCP servers**:
 
